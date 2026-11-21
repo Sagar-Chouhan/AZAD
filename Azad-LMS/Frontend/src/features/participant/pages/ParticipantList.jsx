@@ -1,0 +1,269 @@
+import { useState, useEffect, useCallback } from 'react';
+import {
+    getParticipants,
+    exportParticipants,
+    getStates,
+    getDistricts,
+    getAllCentres,
+    getBatches,
+} from '@/features/participant/services/ParticipantService';
+import ParticipantTable, { BRAND } from '@/features/participant/components/ParticipantTable';
+import ParticipantFilter from '@/features/participant/components/ParticipantFilter';
+import AppLayout from '@/components/layout/AppLayout';
+import Pagination from '@/shared/components/table/Pagination';
+import ExportButton from '@/shared/components/table/ExportButton';
+import ManageModuleModal from '@/features/participant/components/ManageModuleModal';
+import TimeSpentModal from '@/features/participant/components/TimeSpentModal';
+import CredentialsModal from '@/features/participant/components/CredentialsModal';
+import Breadcrumbs from '@/shared/components/breadcrumbs/Breadcrumbs';
+import { useNavigate } from "react-router-dom";
+
+const PAGE_SIZE = 10;
+
+export default function ParticipantList() {
+    // Filter dropdown data 
+    const [states, setStates] = useState([]);
+    const [districts, setDistricts] = useState([]);
+    const [centres, setCentres] = useState([]);
+    const [batches, setBatches] = useState([]);
+    const navigate = useNavigate();
+
+    // Selected filters (pending vs applied so Search/Reset behave predictably) 
+    const [filters, setFilters] = useState({
+        state_id: '',
+        district_id: '',
+        centre_id: '',
+        batch_id: '',
+        search: '',
+    });
+    const [appliedFilters, setAppliedFilters] = useState(filters);
+
+    // Table data 
+    const [participants, setParticipants] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState(null);
+    const [page, setPage] = useState(1);
+
+    // Row-action modals 
+    const [activeModal, setActiveModal] = useState(null); // 'modules' | 'time' | 'creds' 
+    const [activeParticipant, setActiveParticipant] = useState(null);
+
+    // ---- load dropdown data ---- 
+
+    useEffect(() => {
+        getStates().then(setStates).catch(() => setStates([]));
+    }, []);
+
+    useEffect(() => {
+        if (!filters.state_id) {
+            setDistricts([]);
+            return;
+        }
+        getDistricts(filters.state_id)
+            .then(setDistricts)
+            .catch(() => setDistricts([]));
+    }, [filters.state_id]);
+
+    useEffect(() => {
+        if (!filters.state_id) {
+            setCentres([]);
+            return;
+        }
+        getAllCentres({
+            state_id: filters.state_id,
+            district_id: filters.district_id || undefined,
+        })
+            .then((data) => setCentres(Array.isArray(data) ? data : []))
+            .catch(() => setCentres([]));
+    }, [filters.state_id, filters.district_id]);
+
+    useEffect(() => {
+        if (!filters.centre_id) {
+            setBatches([]);
+            return;
+        }
+        getBatches(filters.centre_id)
+            .then((data) => setBatches(Array.isArray(data) ? data : []))
+            .catch(() => setBatches([]));
+    }, [filters.centre_id]);
+
+    // ---- load participants whenever applied filters change ---- 
+
+    const loadParticipants = useCallback(async () => {
+        setLoading(true);
+        setError(null);
+        try {
+            const data = await getParticipants({
+                state_id: appliedFilters.state_id || undefined,
+                district_id: appliedFilters.district_id || undefined,
+                centre_id: appliedFilters.centre_id || undefined,
+                batch_id: appliedFilters.batch_id || undefined,
+                search: appliedFilters.search || undefined,
+            });
+            setParticipants(Array.isArray(data) ? data : []);
+        } catch (err) {
+            setError('Could not load trainees. Please try again.');
+        } finally {
+            setLoading(false);
+        }
+    }, [appliedFilters]);
+
+    useEffect(() => {
+        loadParticipants();
+    }, [loadParticipants]);
+
+    // ---- handlers ---- 
+
+    const handleFilterChange = (key) => (e) => {
+        const value = e.target.value;
+        setFilters((prev) => {
+            const next = { ...prev, [key]: value };
+            if (key === 'state_id') {
+                next.district_id = '';
+                next.centre_id = '';
+                next.batch_id = '';
+            } else if (key === 'district_id') {
+                next.centre_id = '';
+                next.batch_id = '';
+            } else if (key === 'centre_id') {
+                next.batch_id = '';
+            }
+            return next;
+        });
+    };
+
+    const handleSearch = () => {
+        setPage(1);
+        setAppliedFilters(filters);
+    };
+
+    const handleReset = () => {
+        const empty = { state_id: '', district_id: '', centre_id: '', batch_id: '', search: '' };
+        setFilters(empty);
+        setAppliedFilters(empty);
+        setDistricts([]);
+        setCentres([]);
+        setBatches([]);
+        setPage(1);
+    };
+
+    const handleAddTrainee = () => { };
+
+    // ---- action handlers passed down to the table (wire these to real routes) ---- 
+
+    const handleEdit = (p) => {
+        if (!p?.participant_id) return;
+        navigate(`/participants/${p.participant_id}/edit`);
+    };
+    const handleViewReport = (p) => {
+        if (!p?.participant_id) return;
+        navigate(`/participants/view/${p.participant_id}`);
+    };
+    const handleManageModules = (p) => {
+        setActiveParticipant(p);
+        setActiveModal('modules');
+    };
+    const handleTimeSpent = (p) => {
+        setActiveParticipant(p);
+        setActiveModal('time');
+    };
+    const handleResetPassword = (p) => {
+        setActiveParticipant(p);
+        setActiveModal('creds');
+    };
+
+    const closeModal = () => {
+        setActiveModal(null);
+        setActiveParticipant(null);
+    };
+
+    // ---- client-side pagination (backend doesn't paginate yet) ---- 
+
+    const totalPages = Math.max(1, Math.ceil(participants.length / PAGE_SIZE));
+    const startIndex = (page - 1) * PAGE_SIZE;
+    const pageRows = participants.slice(startIndex, startIndex + PAGE_SIZE);
+    const pageNumbers = Array.from({ length: totalPages }, (_, i) => i + 1).slice(
+        Math.max(0, page - 5),
+        Math.max(0, page - 5) + 10
+    );
+
+    return (
+        <AppLayout>
+
+            <div className="flex items-center justify-between mb-4">
+                <span className="text-lg font-semibold text-[#1a1e22]">Trainees List</span>
+                <Breadcrumbs
+                    items={[
+                        { label: 'Home', path: '/dashboard' },
+                        { label: 'Trainees', path: '/participants/list' },
+                        { label: 'Trainees List' },
+                    ]}
+                />
+            </div>
+            <div className="bg-gray-50 min-h-screen">
+
+                {/* Filters + Total/Add row (separate component) */}
+                <ParticipantFilter
+                    filters={filters}
+                    states={states}
+                    districts={districts}
+                    centres={centres}
+                    batches={batches}
+                    totalCount={participants.length}
+                    onFilterChange={handleFilterChange}
+                    onSearch={handleSearch}
+                    onReset={handleReset}
+                    onAddTrainee={handleAddTrainee}
+                />
+
+                {/* Table (separate component) */}
+                <ParticipantTable
+                    rows={pageRows}
+                    loading={loading}
+                    error={error}
+                    startIndex={startIndex}
+                    onEdit={handleEdit}
+                    onViewReport={handleViewReport}
+                    onManageModules={handleManageModules}
+                    onTimeSpent={handleTimeSpent}
+                    onResetPassword={handleResetPassword}
+                />
+
+                {/* Export + pagination */}
+                <div className="flex items-center justify-between mt-4 px-3 pb-2 "  >
+                    <ExportButton
+                        exportFunction={exportParticipants}
+                        params={appliedFilters}
+                        filename="trainees.xlsx"
+                        sheetName="Trainees"
+                    />
+                    <Pagination currentPage={page} totalPages={totalPages} onPageChange={setPage} />
+                </div>
+            </div>
+
+            {activeModal === 'modules' && activeParticipant && (
+                <ManageModuleModal
+                    participantId={activeParticipant.participant_id}
+                    participantName={activeParticipant.participant_name}
+                    onClose={closeModal}
+                />
+            )}
+
+            {activeModal === 'time' && activeParticipant && (
+                <TimeSpentModal
+                    participantId={activeParticipant.participant_id}
+                    participantName={activeParticipant.participant_name}
+                    onClose={closeModal}
+                />
+            )}
+
+            {activeModal === 'creds' && activeParticipant && (
+                <CredentialsModal
+                    participantId={activeParticipant.participant_id}
+                    participantName={activeParticipant.participant_name}
+                    onClose={closeModal}
+                />
+            )}
+        </AppLayout>
+    );
+} 

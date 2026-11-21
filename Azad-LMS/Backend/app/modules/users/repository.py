@@ -1,0 +1,2522 @@
+from collections import defaultdict
+from datetime import date
+from sqlalchemy import BigInteger, Date, String, and_, case, cast, distinct, func, or_
+from fastapi import HTTPException
+from sqlalchemy.orm import Session
+from app.database import db
+
+from app.modules.auth.security import hash_password, verify_password
+
+from app.modules.assessment.model import (
+    AssessmentMapping,
+    DropBucket,
+    DropBucketItem,
+    DropBucketMaster,
+    MatchCorrectAnswer,
+    MatchLeftItem,
+    MatchMakingMaster,
+    MatchRightItem,
+    McqMaster,
+    McqQuestionOption,
+    PostSessionAssessment,
+    ScqMaster,
+    ScqQuestionOption,
+)
+from app.modules.auth.model import User
+from app.modules.batch.model import BatchMaster, BatchParticipant
+from app.modules.centres.model import BlockMaster, CentreMaster
+from app.modules.dashboard.model import ParticipantModule
+from app.modules.master.district.model import DistrictMaster
+from app.modules.master.state.model import StateMaster
+from app.modules.module.model import ModuleMaster, ModuleType
+from app.modules.users.model import (
+    ParticipantDb,
+    ParticipantMaster,
+    ParticipantMcq,
+    ParticipantMm,
+    ParticipantScq,
+)
+from app.modules.users.schema import ParticipantCreateRequest
+
+
+class UserRepository:
+    @staticmethod
+    def get_states(db: Session):
+        return (
+            db.query(
+                StateMaster.state_lgd_code,
+                StateMaster.state_name,
+            )
+            .filter(or_(func.lower(StateMaster.status) == "active", StateMaster.status == "1"))
+            .order_by(StateMaster.state_name.asc())
+            .all()
+        )
+
+    @staticmethod
+    def get_districts(db: Session, state_lgd_code: int):
+        return (
+            db.query(
+                DistrictMaster.district_lgd_code,
+                DistrictMaster.district_name,
+            )
+            .filter(
+                DistrictMaster.state_lgd_code == state_lgd_code,
+                or_(func.lower(DistrictMaster.status) == "active", DistrictMaster.status == "1"),
+            )
+            .order_by(DistrictMaster.district_name.asc())
+            .all()
+        )
+
+    @staticmethod
+    def get_blocks(db: Session, district_lgd_code: str | int):
+        district_code_str = str(district_lgd_code).strip()
+        district = db.query(DistrictMaster).filter(
+            or_(
+                DistrictMaster.district_code == district_code_str,
+                DistrictMaster.id == int(district_code_str) if district_code_str.isdigit() else False,
+            )
+        ).first()
+
+        filter_cond = None
+        if district:
+            filter_cond = or_(
+                BlockMaster.district_lgd_code == district.id,
+                BlockMaster.district_lgd_code == getattr(district, "district_lgd_code", None),
+            )
+        elif district_code_str.isdigit():
+            filter_cond = (BlockMaster.district_lgd_code == int(district_code_str))
+        else:
+            return []
+
+        return (
+            db.query(
+                BlockMaster.block_lgd_code,
+                BlockMaster.block_name,
+            )
+            .filter(
+                filter_cond,
+                BlockMaster.status == "1",
+            )
+            .order_by(BlockMaster.block_name.asc())
+            .all()
+        )
+
+    @staticmethod
+    def get_centres(db: Session, block_id: str | int):
+        block_id_val = int(block_id) if str(block_id).isdigit() else None
+        if block_id_val is not None:
+            block = db.query(BlockMaster).filter(
+                or_(
+                    BlockMaster.id == block_id_val,
+                    BlockMaster.block_lgd_code == block_id_val,
+                )
+            ).first()
+
+            if block and block.district_lgd_code:
+                district = db.query(DistrictMaster).filter(
+                    or_(
+                        DistrictMaster.id == block.district_lgd_code,
+                        DistrictMaster.district_code == str(block.district_lgd_code),
+                    )
+                ).first()
+                if district and district.district_code:
+                    centres = (
+                        db.query(
+                            CentreMaster.centre_id,
+                            CentreMaster.centre_name,
+                        )
+                        .filter(
+                            CentreMaster.district_code == district.district_code,
+                            CentreMaster.deleted_at.is_(None),
+                            CentreMaster.status.in_(["Active", "active", "1"]),
+                        )
+                        .order_by(CentreMaster.centre_name.asc())
+                        .all()
+                    )
+                    if centres:
+                        return centres
+
+        query = db.query(
+            CentreMaster.centre_id,
+            CentreMaster.centre_name,
+        ).filter(
+            CentreMaster.deleted_at.is_(None),
+            CentreMaster.status.in_(["Active", "active", "1"]),
+        )
+        if block_id_val is not None:
+            query = query.filter(CentreMaster.block_id == block_id_val)
+
+        return query.order_by(CentreMaster.centre_name.asc()).all()
+
+    @staticmethod
+    def get_by_email(db: Session, email: str):
+        normalized_email = email.strip().lower()
+        return (
+            db.query(User)
+            .filter(func.lower(func.trim(User.email)) == normalized_email)
+        .first()
+        )
+
+    @staticmethod
+    def get_by_username(db: Session, username: str):
+        return (
+            db.query(User)
+            .filter(User.status == "1")
+            .filter(User.username == username)
+            .first()
+        )
+
+    @staticmethod
+    def create_user(db: Session, user: User):
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user
+
+    @staticmethod
+    def get_users(db: Session):
+        return (
+            db.query(User)
+            .filter(or_(func.lower(User.status) == "active", User.status == "1"))
+            .order_by(User.id.desc())
+            .all()
+        )
+
+    @staticmethod
+    def get_user_by_id(db: Session, user_id: int):
+        return (
+            db.query(
+                User,
+                StateMaster.state_name,
+                DistrictMaster.district_name,
+                BlockMaster.block_name,
+                CentreMaster.centre_name,
+            )
+            .outerjoin(
+                StateMaster,
+                User.state_lgd_code == StateMaster.state_lgd_code,
+            )
+            .outerjoin(
+                DistrictMaster,
+                User.district_lgd_code == DistrictMaster.district_lgd_code,
+            )
+            .outerjoin(
+                BlockMaster,
+                User.block_lgd_code == BlockMaster.block_lgd_code,
+            )
+            .outerjoin(
+                CentreMaster,
+                User.centre_id == CentreMaster.centre_id,
+            )
+            .filter(User.id == user_id)
+            .first()
+        )
+
+    @staticmethod
+    def update_user(db: Session, user: User):
+        db.commit()
+        db.refresh(user)
+        return user
+
+    @staticmethod
+    def delete_user(db: Session, user: User):
+        db.delete(user)
+        db.commit()
+
+    @staticmethod
+    def get_by_id(db: Session, user_id: int):
+        return (
+            db.query(User).filter(User.status == "1").filter(User.id == user_id).first()
+        )
+
+    @staticmethod
+    def get_by_id_for_delete(db: Session, user_id: int):
+        return db.query(User).filter(User.id == user_id).first()
+
+    @staticmethod
+    def get_by_email_except_user(
+        db: Session,
+        email: str,
+        user_id: int,
+    ):
+        normalized_email = email.strip().lower()
+        return (
+            db.query(User)
+        .filter(
+            func.lower(func.trim(User.email)) == normalized_email,
+            User.id != user_id,
+        )
+        .first()
+        )
+
+    @staticmethod
+    def get_batches(
+        db: Session,
+        centre_id: int,
+    ):
+        return (
+            db.query(
+                BatchMaster.batch_id,
+                BatchMaster.batch_name,
+                BatchMaster.fy_year,
+                CentreMaster.centre_name,
+            )
+            .join(
+                CentreMaster,
+                BatchMaster.centre_id == CentreMaster.centre_id,
+            )
+            .filter(
+                BatchMaster.centre_id == centre_id,
+                BatchMaster.status == 1,
+                BatchMaster.deleted_at.is_(None),
+            )
+            .order_by(BatchMaster.batch_name)
+            .all()
+        )
+
+    @staticmethod
+    def get_enrollment(
+        db: Session,
+        batch_id: int,
+    ):
+        return (
+            db.query(
+                ParticipantMaster.participant_id,
+                ParticipantMaster.enrollment_no,
+                ParticipantMaster.participant_name,
+            )
+            .select_from(BatchParticipant)
+            .join(
+                ParticipantMaster,
+                BatchParticipant.participant_id == ParticipantMaster.participant_id,
+            )
+            .filter(
+                BatchParticipant.batch_id == batch_id,
+                BatchParticipant.deleted_at.is_(None),
+            )
+            .order_by(ParticipantMaster.participant_name)
+            .all()
+        )
+
+    @staticmethod
+    def create_participant(
+        db: Session,
+        data: ParticipantCreateRequest,
+        image_name: str | None,
+    ):
+        # Check for duplicate enrollment_no
+        existing_enrollment = (
+            db.query(ParticipantMaster)
+            .filter(
+                ParticipantMaster.enrollment_no == data.enrollment_no,
+                ParticipantMaster.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if existing_enrollment:
+            return "duplicate_enrollment_no"
+
+        username = (data.username or "").strip()
+        # Check for duplicate username
+        existing_username = (
+            db.query(ParticipantMaster)
+            .filter(
+                func.lower(func.trim(ParticipantMaster.username)) == username.lower(),
+                ParticipantMaster.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if existing_username:
+            return "duplicate_username"
+
+        hashed_password = hash_password(data.password)
+
+        participant = ParticipantMaster(
+            enrollment_no=data.enrollment_no,
+            participant_name=data.participant_name,
+            username=username,
+            password=hashed_password,
+            gender=data.gender,
+            age=data.age,
+            email=data.email,
+            mobile_no=data.mobile_no,
+            location=data.location,
+            address=data.address,
+            block_id=data.block_id,
+            district_id=data.district_id,
+            state_id=data.state_id,
+            pin=data.pin,
+            aadhaar_number=data.aadhaar_number,
+            images=image_name,
+            status="1",
+            progress_status=0,
+            course_progress=0,
+        )
+
+        db.add(participant)
+        db.flush()  # Generates participant_id
+
+        batch_participant = BatchParticipant(
+            batch_id=data.batch_id,
+            participant_id=participant.participant_id,
+        )
+
+        db.add(batch_participant)
+
+        db.commit()
+
+        db.refresh(participant)
+
+        return participant
+
+    @staticmethod
+    def assign_batch(
+        db: Session,
+        batch_id: int,
+        participant_id: int,
+    ):
+        # Don't create a duplicate mapping if this participant is already in
+        # this batch — that would show the trainee twice in the list.
+        existing = (
+            db.query(BatchParticipant)
+            .filter(
+                BatchParticipant.batch_id == batch_id,
+                BatchParticipant.participant_id == participant_id,
+                BatchParticipant.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if existing:
+            return existing
+
+        mapping = BatchParticipant(
+            batch_id=batch_id,
+            participant_id=participant_id,
+        )
+
+        db.add(mapping)
+        db.commit()
+        db.refresh(mapping)
+
+        return mapping
+
+    @staticmethod
+    def get_all_centres(
+        db: Session,
+        state_id: int | None = None,
+        district_id: int | None = None,
+    ):
+        query = db.query(
+            CentreMaster.centre_id,
+            CentreMaster.centre_name,
+        )
+        if hasattr(CentreMaster, "deleted_at"):
+            query = query.filter(CentreMaster.deleted_at.is_(None))
+        query = query.filter(CentreMaster.status.in_(["Active", "active", "1"]))
+        if state_id is not None and str(state_id).strip() not in ("", "0", "null", "undefined"):
+            try:
+                query = query.filter(CentreMaster.state_id == int(state_id))
+            except (ValueError, TypeError):
+                pass
+        if district_id is not None and str(district_id).strip() not in ("", "0", "null", "undefined"):
+            dist_str = str(district_id).strip()
+            district = db.query(DistrictMaster).filter(
+                or_(
+                    DistrictMaster.district_code == dist_str,
+                    DistrictMaster.id == int(dist_str) if dist_str.isdigit() else False,
+                )
+            ).first()
+            if district and district.district_code:
+                query = query.filter(CentreMaster.district_code == district.district_code)
+            else:
+                query = query.filter(CentreMaster.district_code == dist_str)
+        return query.order_by(CentreMaster.centre_name).all()
+
+    @staticmethod
+    def get_batches(
+        db: Session,
+        centre_id: int | None = None,
+    ):
+        query = (
+            db.query(
+                BatchMaster.batch_id,
+                BatchMaster.batch_name,
+                BatchMaster.fy_year,
+                CentreMaster.centre_name,
+            )
+            .join(
+                CentreMaster,
+                BatchMaster.centre_id == CentreMaster.centre_id,
+            )
+            .filter(
+                BatchMaster.status == 1,
+                BatchMaster.deleted_at.is_(None),
+            )
+        )
+
+        if centre_id:
+            query = query.filter(BatchMaster.centre_id == centre_id)
+
+        return query.order_by(BatchMaster.batch_name).all()
+
+    @staticmethod
+    def get_participants(
+        db: Session,
+        state_id: int | None = None,
+        district_id: int | None = None,
+        centre_id: int | None = None,
+        batch_id: int | None = None,
+        search: str | None = None,
+        from_date: date | None = None,
+        to_date: date | None = None,
+        **kwargs,
+    ):
+        # ------------------------------------------------------------------
+        # Score sub-queries (MCQ + SCQ) -> Performance chip.
+        # ------------------------------------------------------------------
+        mcq_perf = (
+            db.query(
+                ParticipantMcq.participant_id.label("participant_id"),
+                func.count(case((ParticipantMcq.option_selected.isnot(None), 1))).label(
+                    "attempted"
+                ),
+                func.count(
+                    case((McqQuestionOption.is_mcq_option_correct == 1, 1))
+                ).label("correct"),
+            )
+            .outerjoin(
+                McqQuestionOption,
+                ParticipantMcq.option_selected
+                == cast(McqQuestionOption.mcq_option_id, String),
+            )
+            .group_by(ParticipantMcq.participant_id)
+            .subquery()
+        )
+
+        scq_perf = (
+            db.query(
+                ParticipantScq.participant_id.label("participant_id"),
+                func.count(case((ParticipantScq.option_selected.isnot(None), 1))).label(
+                    "attempted"
+                ),
+                func.count(
+                    case((ScqQuestionOption.is_scq_option_correct == 1, 1))
+                ).label("correct"),
+            )
+            .outerjoin(
+                ScqQuestionOption,
+                ParticipantScq.option_selected
+                == cast(ScqQuestionOption.scq_option_id, String),
+            )
+            .group_by(ParticipantScq.participant_id)
+            .subquery()
+        )
+
+        # ------------------------------------------------------------------
+        # Completion sub-queries -> Course Progress.
+        # Course Progress = completed questions / configured questions * 100,
+        # matching the report's PROGRESS metric (100% when the whole
+        # assessment is done, otherwise proportional to what's completed).
+        # "done" is counted distinctly per question type across all four
+        # question kinds; "configured" is the distinct set of questions
+        # mapped to the participant's assigned modules.
+        # ------------------------------------------------------------------
+        mcq_done = (
+            db.query(
+                ParticipantMcq.participant_id.label("participant_id"),
+                func.count(distinct(ParticipantMcq.mcq_id)).label("done"),
+            )
+            .filter(ParticipantMcq.option_selected.isnot(None))
+            .group_by(ParticipantMcq.participant_id)
+            .subquery()
+        )
+
+        scq_done = (
+            db.query(
+                ParticipantScq.participant_id.label("participant_id"),
+                func.count(distinct(ParticipantScq.single_choice_id)).label("done"),
+            )
+            .filter(ParticipantScq.option_selected.isnot(None))
+            .group_by(ParticipantScq.participant_id)
+            .subquery()
+        )
+
+        mm_done = (
+            db.query(
+                ParticipantMm.participant_id.label("participant_id"),
+                func.count(distinct(ParticipantMm.question_id)).label("done"),
+            )
+            .group_by(ParticipantMm.participant_id)
+            .subquery()
+        )
+
+        db_done = (
+            db.query(
+                ParticipantDb.participant_id.label("participant_id"),
+                func.count(distinct(DropBucket.drop_bucket_id)).label("done"),
+            )
+            .join(DropBucket, DropBucket.bucket_id == ParticipantDb.bucket_id)
+            .group_by(ParticipantDb.participant_id)
+            .subquery()
+        )
+
+        configured = (
+            db.query(
+                ParticipantModule.participant_id.label("participant_id"),
+                func.count(
+                    distinct(
+                        func.concat(
+                            AssessmentMapping.assessment_type,
+                            ":",
+                            cast(AssessmentMapping.assessment_ref_id, String),
+                        )
+                    )
+                ).label("total"),
+            )
+            .join(
+                PostSessionAssessment,
+                PostSessionAssessment.module_id == ParticipantModule.module_id,
+            )
+            .join(
+                AssessmentMapping,
+                AssessmentMapping.assessment_id == PostSessionAssessment.assessment_id,
+            )
+            .filter(
+                ParticipantModule.status == "1",
+                PostSessionAssessment.is_active == 1,
+                PostSessionAssessment.deleted_at.is_(None),
+                AssessmentMapping.is_active == 1,
+            )
+            .group_by(ParticipantModule.participant_id)
+            .subquery()
+        )
+
+        # Distinct participant-to-batch mapping to avoid duplicate trainee counts
+        p_batch = (
+            db.query(
+                BatchParticipant.participant_id.label("participant_id"),
+                func.min(BatchParticipant.batch_id).label("batch_id"),
+            )
+            .filter(BatchParticipant.deleted_at.is_(None))
+            .group_by(BatchParticipant.participant_id)
+            .subquery()
+        )
+
+        query = (
+            db.query(
+                ParticipantMaster.participant_id,
+                ParticipantMaster.participant_name,
+                ParticipantMaster.enrollment_no,
+                ParticipantMaster.mobile_no,
+                ParticipantMaster.age,
+                ParticipantMaster.status,
+                ParticipantMaster.images.label("image"),
+                StateMaster.state_name,
+                DistrictMaster.district_name,
+                CentreMaster.centre_name,
+                BatchMaster.batch_name,
+                mcq_perf.c.attempted.label("mcq_attempted"),
+                mcq_perf.c.correct.label("mcq_correct"),
+                scq_perf.c.attempted.label("scq_attempted"),
+                scq_perf.c.correct.label("scq_correct"),
+                mcq_done.c.done.label("mcq_done"),
+                scq_done.c.done.label("scq_done"),
+                mm_done.c.done.label("mm_done"),
+                db_done.c.done.label("db_done"),
+                configured.c.total.label("configured_total"),
+            )
+            .outerjoin(
+                p_batch,
+                ParticipantMaster.participant_id == p_batch.c.participant_id,
+            )
+            .outerjoin(
+                BatchMaster,
+                and_(
+                    p_batch.c.batch_id == BatchMaster.batch_id,
+                    BatchMaster.deleted_at.is_(None),
+                ),
+            )
+            .outerjoin(
+                CentreMaster,
+                BatchMaster.centre_id == CentreMaster.centre_id,
+            )
+            .outerjoin(
+                StateMaster,
+                StateMaster.state_lgd_code == func.coalesce(ParticipantMaster.state_id, CentreMaster.state_id),
+            )
+            .outerjoin(
+                DistrictMaster,
+                or_(
+                    DistrictMaster.district_code == CentreMaster.district_code,
+                    DistrictMaster.district_lgd_code == ParticipantMaster.district_id,
+                ),
+            )
+            .outerjoin(
+                mcq_perf,
+                ParticipantMaster.participant_id == mcq_perf.c.participant_id,
+            )
+            .outerjoin(
+                scq_perf,
+                ParticipantMaster.participant_id == scq_perf.c.participant_id,
+            )
+            .outerjoin(
+                mcq_done,
+                ParticipantMaster.participant_id == mcq_done.c.participant_id,
+            )
+            .outerjoin(
+                scq_done,
+                ParticipantMaster.participant_id == scq_done.c.participant_id,
+            )
+            .outerjoin(
+                mm_done,
+                ParticipantMaster.participant_id == mm_done.c.participant_id,
+            )
+            .outerjoin(
+                db_done,
+                ParticipantMaster.participant_id == db_done.c.participant_id,
+            )
+            .outerjoin(
+                configured,
+                ParticipantMaster.participant_id == configured.c.participant_id,
+            )
+            .filter(
+                ParticipantMaster.deleted_at.is_(None),
+            )
+        )
+
+        if state_id:
+            query = query.filter(ParticipantMaster.state_id == state_id)
+
+        if district_id:
+            query = query.filter(ParticipantMaster.district_id == district_id)
+
+        if centre_id:
+            query = query.filter(BatchMaster.centre_id == centre_id)
+
+        if batch_id:
+            query = query.filter(BatchMaster.batch_id == batch_id)
+
+        if search:
+            search_token = f"%{search.strip()}%"
+            query = query.filter(
+                or_(
+                    ParticipantMaster.participant_name.ilike(search_token),
+                    ParticipantMaster.enrollment_no.ilike(search_token),
+                    ParticipantMaster.mobile_no.ilike(search_token),
+                )
+            )
+
+        if from_date:
+            query = query.filter(func.cast(ParticipantMaster.created_at, Date) >= from_date)
+
+        if to_date:
+            query = query.filter(func.cast(ParticipantMaster.created_at, Date) <= to_date)
+
+        # Newest trainees first, so a just-added trainee shows at the top.
+        rows = query.order_by(ParticipantMaster.participant_id.desc()).all()
+
+        # A participant mapped to more than one batch (or with a stale
+        # duplicate mapping) would otherwise appear once per mapping. Show
+        # each participant only once, keeping name order.
+        seen = set()
+        deduped = []
+        for row in rows:
+            if row.participant_id in seen:
+                continue
+            seen.add(row.participant_id)
+            deduped.append(row)
+
+        return deduped
+
+    @staticmethod
+    def get_participant_edit(db: Session, participant_id: int):
+        p = (
+            db.query(ParticipantMaster)
+            .filter(
+                ParticipantMaster.participant_id == participant_id,
+                ParticipantMaster.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if not p:
+            return None
+
+        bp = (
+            db.query(BatchParticipant.batch_id, BatchMaster.centre_id)
+            .join(BatchMaster, BatchMaster.batch_id == BatchParticipant.batch_id)
+            .filter(
+                BatchParticipant.participant_id == participant_id,
+                BatchParticipant.deleted_at.is_(None),
+            )
+            .first()
+        )
+
+        return {
+            "participant_id": p.participant_id,
+            "participant_name": p.participant_name,
+            "enrollment_no": p.enrollment_no,
+            "username": p.username,
+            "gender": p.gender,
+            "age": p.age,
+            "email": p.email,
+            "mobile_no": p.mobile_no,
+            "location": p.location,
+            "address": p.address,
+            "pin": p.pin,
+            "aadhaar_number": p.aadhaar_number,
+            "state_id": p.state_id,
+            "district_id": p.district_id,
+            "block_id": p.block_id,
+            "centre_id": bp.centre_id if bp else None,
+            "batch_id": bp.batch_id if bp else None,
+            "image": p.images,
+        }
+
+    # @staticmethod
+    # def update_participant(db: Session, participant_id: int, data: dict, image_name):
+    #     p = (
+    #         db.query(ParticipantMaster)
+    #         .filter(
+    #             ParticipantMaster.participant_id == participant_id,
+    #             ParticipantMaster.deleted_at.is_(None),
+    #         )
+    #         .first()
+    #     )
+    #     if not p:
+    #         return None
+
+    #     # Editable fields only (enrollment / username / password are not changed here).
+    #     p.participant_name = data.get("participant_name", p.participant_name)
+    #     p.age = data.get("age", p.age)
+    #     p.gender = data.get("gender", p.gender)
+    #     p.email = data.get("email", p.email)
+    #     p.mobile_no = data.get("mobile_no", p.mobile_no)
+    #     p.pin = data.get("pin", p.pin)
+    #     p.aadhaar_number = data.get("aadhaar_number", p.aadhaar_number)
+    #     p.location = data.get("location", p.location)
+    #     p.address = data.get("address", p.address)
+    #     if data.get("state_id"):
+    #         p.state_id = data["state_id"]
+    #     if data.get("district_id"):
+    #         p.district_id = data["district_id"]
+    #     if data.get("block_id"):
+    #         p.block_id = data["block_id"]
+    #     if image_name:
+    #         p.images = image_name
+
+    #     db.commit()
+    #     db.refresh(p)
+    #     return p
+    @staticmethod
+    def update_participant(
+        db: Session,
+        participant_id: int,
+        data: dict,
+        image_name=None,
+    ):
+        participant = (
+            db.query(ParticipantMaster)
+            .filter(
+                ParticipantMaster.participant_id == participant_id,
+                ParticipantMaster.deleted_at.is_(None),
+            )
+            .first()
+        )
+
+        if not participant:
+            return None
+
+        # Basic participant details
+        if data.get("participant_name") is not None:
+            participant.participant_name = data["participant_name"]
+
+        if data.get("age") is not None:
+            participant.age = data["age"]
+
+        if data.get("gender") is not None:
+            participant.gender = data["gender"]
+
+        if data.get("email") is not None:
+            participant.email = data["email"]
+
+        if data.get("mobile_no") is not None:
+            participant.mobile_no = data["mobile_no"]
+
+        if data.get("pin") is not None:
+            participant.pin = data["pin"]
+
+        if data.get("aadhaar_number") is not None:
+            participant.aadhaar_number = data["aadhaar_number"]
+
+        if data.get("location") is not None:
+            participant.location = data["location"]
+
+        if data.get("address") is not None:
+            participant.address = data["address"]
+
+        # Editable location
+        if data.get("state_id") is not None:
+            participant.state_id = data["state_id"]
+
+        if data.get("district_id") is not None:
+            participant.district_id = data["district_id"]
+
+        if data.get("block_id") is not None:
+            participant.block_id = data["block_id"]
+
+        # Enrollment number
+        enrollment_no = data.get("enrollment_no")
+
+        if enrollment_no:
+            participant.enrollment_no = enrollment_no
+
+        # Batch / Centre mapping
+        batch_id = data.get("batch_id")
+
+        if batch_id is not None:
+            batch_participant = (
+                db.query(BatchParticipant)
+                .filter(
+                    BatchParticipant.participant_id == participant_id,
+                    BatchParticipant.deleted_at.is_(None),
+                )
+                .first()
+            )
+
+            if batch_participant:
+                batch_participant.batch_id = int(batch_id)
+            else:
+                batch_participant = BatchParticipant(
+                    participant_id=participant_id,
+                    batch_id=int(batch_id),
+                )
+                db.add(batch_participant)
+
+        # Image
+        if image_name:
+            participant.images = image_name
+
+        db.commit()
+        db.refresh(participant)
+
+        return participant
+
+    @staticmethod
+    def get_participant_profile(
+        db: Session,
+        participant_id: int,
+    ):
+
+        return (
+            db.query(
+                ParticipantMaster.participant_id,
+                ParticipantMaster.participant_name,
+                ParticipantMaster.enrollment_no,
+                ParticipantMaster.mobile_no,
+                ParticipantMaster.email,
+                ParticipantMaster.location,
+                ParticipantMaster.images.label("image"),
+                StateMaster.state_name.label("state_name"),
+                DistrictMaster.district_name.label("district_name"),
+                CentreMaster.centre_name.label("centre_name"),
+            )
+            .outerjoin(
+                BatchParticipant,
+                and_(
+                    BatchParticipant.participant_id == ParticipantMaster.participant_id,
+                    BatchParticipant.deleted_at.is_(None),
+                ),
+            )
+            .outerjoin(
+                BatchMaster,
+                and_(
+                    BatchMaster.batch_id == BatchParticipant.batch_id,
+                    BatchMaster.deleted_at.is_(None),
+                ),
+            )
+            .outerjoin(
+                CentreMaster,
+                CentreMaster.centre_id == BatchMaster.centre_id,
+            )
+            .outerjoin(
+                StateMaster,
+                StateMaster.state_lgd_code == ParticipantMaster.state_id,
+            )
+            .outerjoin(
+                DistrictMaster,
+                DistrictMaster.district_lgd_code == ParticipantMaster.district_id,
+            )
+            .filter(
+                ParticipantMaster.participant_id == participant_id,
+                ParticipantMaster.deleted_at.is_(None),
+            )
+            .first()
+        )
+
+    @staticmethod
+    def get_assessment_summary(
+        db: Session,
+        participant_id: int,
+        attempt_wise_result: list,
+    ):
+        # ============================================================
+        # Get assigned modules
+        # ============================================================
+        assigned_module_ids = [
+            row.module_id
+            for row in db.query(ParticipantModule.module_id)
+            .filter(
+                ParticipantModule.participant_id == participant_id,
+                or_(
+                    ParticipantModule.status == "1",
+                    ParticipantModule.status == "2",
+                    ParticipantModule.status.ilike("completed"),
+                    ParticipantModule.lock_status.isnot(None),
+                ),
+            )
+            .all()
+        ]
+        if not assigned_module_ids:
+            assigned_module_ids = [
+                row.module_id
+                for row in db.query(ParticipantModule.module_id)
+                .filter(ParticipantModule.participant_id == participant_id)
+                .all()
+            ]
+
+        if not assigned_module_ids:
+            return {
+                "module_results": [],
+                "total_questions": 0,
+                "completed_questions": 0,
+                "correct": 0,
+                "wrong": 0,
+                "score": 0,
+                "total_marks": 0,
+                "percentage": 0,
+                "progress": 0,
+            }
+
+        # ============================================================
+        # Load assigned modules
+        # ============================================================
+        modules = (
+            db.query(ModuleMaster)
+            .filter(
+                ModuleMaster.module_id.in_(assigned_module_ids),
+                ModuleMaster.deleted_at.is_(None),
+            )
+            .all()
+        )
+
+        module_map = {module.module_id: module for module in modules}
+
+        # ============================================================
+        # Group by parent module
+        # ============================================================
+        modules_by_parent = defaultdict(list)
+
+        for module in modules:
+            parent_id = module.parent_id or module.module_id
+            modules_by_parent[parent_id].append(module.module_id)
+
+        # ============================================================
+        # Get all language variants
+        # ============================================================
+        parent_ids = list(modules_by_parent.keys())
+
+        sibling_modules = (
+            db.query(ModuleMaster)
+            .filter(
+                ModuleMaster.parent_id.in_(parent_ids),
+                ModuleMaster.deleted_at.is_(None),
+            )
+            .all()
+        )
+
+        for sibling in sibling_modules:
+            if sibling.module_id not in modules_by_parent[sibling.parent_id]:
+                modules_by_parent[sibling.parent_id].append(sibling.module_id)
+
+        # ============================================================
+        # Get all child module ids
+        # ============================================================
+        all_module_ids = []
+
+        for child_ids in modules_by_parent.values():
+            all_module_ids.extend(child_ids)
+
+        all_module_ids = list(set(all_module_ids))
+
+        # ============================================================
+        # Load all post assessments
+        # ============================================================
+        post_assessments = (
+            db.query(PostSessionAssessment)
+            .filter(
+                PostSessionAssessment.module_id.in_(all_module_ids),
+                PostSessionAssessment.is_active == 1,
+                PostSessionAssessment.deleted_at.is_(None),
+            )
+            .all()
+        )
+
+        module_assessment_map = defaultdict(list)
+
+        for assessment in post_assessments:
+            module_assessment_map[assessment.module_id].append(assessment.assessment_id)
+
+        # ============================================================
+        # Overall counters
+        # ============================================================
+        module_results = []
+
+        overall_total_questions = 0
+        overall_completed_questions = 0
+        overall_correct = 0
+        overall_wrong = 0
+        overall_score = 0
+        overall_total_marks = 0
+
+        # ============================================================
+        # Process each parent module
+        # ============================================================
+        for parent_id, child_module_ids in modules_by_parent.items():
+
+            module_name = (
+                module_map.get(parent_id).module_name
+                if module_map.get(parent_id)
+                else (
+                    db.query(ModuleMaster.module_name)
+                    .filter(ModuleMaster.module_id == parent_id)
+                    .scalar()
+                )
+            )
+
+            last_attempt_id = None
+            attempted_module_id = None
+
+            # ============================================================
+            # Find latest attempt across all language variants
+            # ============================================================
+            for module_id in child_module_ids:
+
+                mcq_attempt = (
+                    db.query(func.max(ParticipantMcq.attempt_id))
+                    .filter(
+                        ParticipantMcq.participant_id == participant_id,
+                        ParticipantMcq.module_id == module_id,
+                    )
+                    .scalar()
+                )
+
+                scq_attempt = (
+                    db.query(func.max(ParticipantScq.attempt_id))
+                    .filter(
+                        ParticipantScq.participant_id == participant_id,
+                        ParticipantScq.module_id == module_id,
+                    )
+                    .scalar()
+                )
+
+                db_attempt = (
+                    db.query(func.max(ParticipantDb.attempt_id))
+                    .filter(
+                        ParticipantDb.participant_id == participant_id,
+                        ParticipantDb.module_id == module_id,
+                    )
+                    .scalar()
+                )
+
+                mm_attempt = (
+                    db.query(func.max(ParticipantMm.attempt_id))
+                    .filter(
+                        ParticipantMm.participant_id == participant_id,
+                        ParticipantMm.module_id == module_id,
+                    )
+                    .scalar()
+                )
+
+                attempts = [
+                    attempt
+                    for attempt in (
+                        mcq_attempt,
+                        scq_attempt,
+                        db_attempt,
+                        mm_attempt,
+                    )
+                    if attempt is not None
+                ]
+
+                if attempts:
+                    latest_attempt = max(attempts)
+
+                    if last_attempt_id is None or latest_attempt > last_attempt_id:
+                        last_attempt_id = latest_attempt
+                        attempted_module_id = module_id
+
+            # ============================================================
+            # Collect assessment ids for the attempted module variant
+            # (or primary parent module) - single language per parent module
+            # ============================================================
+            target_mid = attempted_module_id or parent_id
+            assessment_ids = list(module_assessment_map.get(target_mid, []))
+            if not assessment_ids:
+                for cid in child_module_ids:
+                    if module_assessment_map.get(cid):
+                        assessment_ids = list(module_assessment_map.get(cid))
+                        break
+
+            # No configured assessment for this module
+            if not assessment_ids:
+                module_results.append(
+                    {
+                        "module_id": parent_id,
+                        "module_name": module_name,
+                        "has_data": False,
+                        "total_questions": 0,
+                        "completed_questions": 0,
+                        "correct": 0,
+                        "wrong": 0,
+                        "score": 0,
+                        "total_marks": 0,
+                        "percentage": 0,
+                        "mcq_list": [],
+                        "scq_list": [],
+                        "bucket_list": [],
+                        "match_making_list": [],
+                    }
+                )
+                continue
+
+            # ============================================================
+            # Get configured question ids
+            # ============================================================
+            configured_mcq_ids = [
+                row.assessment_ref_id
+                for row in db.query(AssessmentMapping.assessment_ref_id)
+                .filter(
+                    AssessmentMapping.assessment_id.in_(assessment_ids),
+                    AssessmentMapping.assessment_type == "MCQ",
+                    AssessmentMapping.is_active == 1,
+                )
+                .all()
+            ]
+
+            configured_scq_ids = [
+                row.assessment_ref_id
+                for row in db.query(AssessmentMapping.assessment_ref_id)
+                .filter(
+                    AssessmentMapping.assessment_id.in_(assessment_ids),
+                    AssessmentMapping.assessment_type == "SCQ",
+                    AssessmentMapping.is_active == 1,
+                )
+                .all()
+            ]
+
+            configured_db_ids = [
+                row.assessment_ref_id
+                for row in db.query(AssessmentMapping.assessment_ref_id)
+                .filter(
+                    AssessmentMapping.assessment_id.in_(assessment_ids),
+                    AssessmentMapping.assessment_type == "DB",
+                    AssessmentMapping.is_active == 1,
+                )
+                .all()
+            ]
+
+            configured_mm_ids = [
+                row.assessment_ref_id
+                for row in db.query(AssessmentMapping.assessment_ref_id)
+                .filter(
+                    AssessmentMapping.assessment_id.in_(assessment_ids),
+                    AssessmentMapping.assessment_type == "MM",
+                    AssessmentMapping.is_active == 1,
+                )
+                .all()
+            ]
+
+            # ============================================================
+            # Configured questions and marks from master tables
+            # ============================================================
+            configured_mcq_count = 0
+            configured_mcq_marks = 0.0
+            if configured_mcq_ids:
+                row = (
+                    db.query(
+                        func.count(McqMaster.mcq_id),
+                        func.coalesce(func.sum(McqMaster.marks), 0),
+                    )
+                    .filter(
+                        McqMaster.mcq_id.in_(configured_mcq_ids),
+                        McqMaster.deleted_at.is_(None),
+                    )
+                    .first()
+                )
+                if row:
+                    configured_mcq_count = int(row[0] or 0)
+                    configured_mcq_marks = float(row[1] or 0.0)
+
+            configured_scq_count = 0
+            configured_scq_marks = 0.0
+            if configured_scq_ids:
+                row = (
+                    db.query(
+                        func.count(ScqMaster.scq_id),
+                        func.coalesce(func.sum(ScqMaster.marks), 0),
+                    )
+                    .filter(
+                        ScqMaster.scq_id.in_(configured_scq_ids),
+                        ScqMaster.deleted_at.is_(None),
+                    )
+                    .first()
+                )
+                if row:
+                    configured_scq_count = int(row[0] or 0)
+                    configured_scq_marks = float(row[1] or 0.0)
+
+            configured_db_count = 0
+            configured_db_marks = 0.0
+            if configured_db_ids:
+                row = (
+                    db.query(
+                        func.count(DropBucketMaster.drop_bucket_id),
+                        func.coalesce(func.sum(DropBucketMaster.marks), 0),
+                    )
+                    .filter(
+                        DropBucketMaster.drop_bucket_id.in_(configured_db_ids),
+                        DropBucketMaster.deleted_at.is_(None),
+                    )
+                    .first()
+                )
+                if row:
+                    configured_db_count = int(row[0] or 0)
+                    configured_db_marks = float(row[1] or 0.0)
+
+            configured_mm_count = 0
+            configured_mm_marks = 0.0
+            if configured_mm_ids:
+                row = (
+                    db.query(
+                        func.count(MatchMakingMaster.match_making_id),
+                        func.coalesce(func.sum(MatchMakingMaster.marks), 0),
+                    )
+                    .filter(
+                        MatchMakingMaster.match_making_id.in_(configured_mm_ids),
+                        MatchMakingMaster.deleted_at.is_(None),
+                    )
+                    .first()
+                )
+                if row:
+                    configured_mm_count = int(row[0] or 0)
+                    configured_mm_marks = float(row[1] or 0.0)
+
+            total_configured_questions = (
+                configured_mcq_count
+                + configured_scq_count
+                + configured_db_count
+                + configured_mm_count
+            )
+            total_configured_marks = (
+                configured_mcq_marks
+                + configured_scq_marks
+                + configured_db_marks
+                + configured_mm_marks
+            )
+
+            # ============================================================
+            # No attempt made for this module
+            # ============================================================
+            if last_attempt_id is None:
+
+                module_results.append(
+                    {
+                        "module_id": parent_id,
+                        "module_name": module_name,
+                        "has_data": False,
+                        "attempt_id": None,
+                        "attempted_module_id": None,
+                        "total_questions": total_configured_questions,
+                        "completed_questions": 0,
+                        "correct": 0,
+                        "wrong": 0,
+                        "score": 0.0,
+                        "total_marks": float(total_configured_marks),
+                        "percentage": 0.0,
+                        "mcq_list": [],
+                        "scq_list": [],
+                        "bucket_list": [],
+                        "match_making_list": [],
+                    }
+                )
+
+                overall_total_questions += total_configured_questions
+                overall_total_marks += float(total_configured_marks)
+
+                continue
+
+            # ============================================================
+            # Find matching attempt
+            # ============================================================
+            matched_attempt = next(
+                (
+                    attempt
+                    for attempt in attempt_wise_result
+                    if attempt["attempt_id"] == last_attempt_id
+                ),
+                None,
+            )
+
+            if matched_attempt is None:
+                module_results.append(
+                    {
+                        "module_id": parent_id,
+                        "module_name": module_name,
+                        "has_data": False,
+                        "total_questions": 0,
+                        "completed_questions": 0,
+                        "correct": 0,
+                        "wrong": 0,
+                        "score": 0,
+                        "total_marks": 0,
+                        "percentage": 0,
+                        "mcq_list": [],
+                        "scq_list": [],
+                        "bucket_list": [],
+                        "match_making_list": [],
+                    }
+                )
+                continue
+
+            # ============================================================
+            # Get question ids actually answered in this attempt
+            # ============================================================
+            module_mcq_ids = {
+                row.mcq_id
+                for row in db.query(ParticipantMcq.mcq_id)
+                .filter(
+                    ParticipantMcq.participant_id == participant_id,
+                    ParticipantMcq.attempt_id == last_attempt_id,
+                    ParticipantMcq.module_id.in_(child_module_ids),
+                )
+                .all()
+            }
+
+            module_scq_ids = {
+                row.single_choice_id
+                for row in db.query(ParticipantScq.single_choice_id)
+                .filter(
+                    ParticipantScq.participant_id == participant_id,
+                    ParticipantScq.attempt_id == last_attempt_id,
+                    ParticipantScq.module_id.in_(child_module_ids),
+                )
+                .all()
+            }
+
+            module_db_ids = {
+                row.bucket_id
+                for row in db.query(ParticipantDb.bucket_id)
+                .filter(
+                    ParticipantDb.participant_id == participant_id,
+                    ParticipantDb.attempt_id == last_attempt_id,
+                    ParticipantDb.module_id.in_(child_module_ids),
+                )
+                .all()
+            }
+
+            module_mm_ids = {
+                row.question_id
+                for row in db.query(ParticipantMm.question_id)
+                .filter(
+                    ParticipantMm.participant_id == participant_id,
+                    ParticipantMm.attempt_id == last_attempt_id,
+                    ParticipantMm.module_id.in_(child_module_ids),
+                )
+                .all()
+            }
+
+            # ============================================================
+            # Merge configured + attempted question ids
+            # ============================================================
+            effective_mcq_ids = set(configured_mcq_ids).union(module_mcq_ids)
+            effective_scq_ids = set(configured_scq_ids).union(module_scq_ids)
+            effective_db_ids = set(configured_db_ids).union(module_db_ids)
+            effective_mm_ids = set(configured_mm_ids).union(module_mm_ids)
+
+            # ============================================================
+            # Filter matched attempt
+            # ============================================================
+            post_mcq = [
+                item
+                for item in matched_attempt.get("mcq_list", [])
+                if item["mcq_id"] in effective_mcq_ids
+            ]
+
+            post_scq = [
+                item
+                for item in matched_attempt.get("scq_list", [])
+                if item["scq_id"] in effective_scq_ids
+            ]
+
+            post_bucket = [
+                item
+                for item in matched_attempt.get("bucket_list", [])
+                if item["drop_bucket_id"] in effective_db_ids
+            ]
+
+            post_mm = [
+                item
+                for item in matched_attempt.get("match_making_list", [])
+                if item["match_making_id"] in effective_mm_ids
+            ]
+
+            completed_questions = (
+                len(post_mcq) + len(post_scq) + len(post_bucket) + len(post_mm)
+            )
+
+            # ============================================================
+            # Calculate module statistics
+            # ============================================================
+            all_post_items = post_mcq + post_scq + post_bucket + post_mm
+
+            total_correct = sum(
+                1 for item in all_post_items if item.get("question_status") == "Correct"
+            )
+
+            total_wrong = sum(
+                1 for item in all_post_items if item.get("question_status") == "Wrong"
+            )
+
+            total_marks = sum(float(item.get("marks") or 0) for item in all_post_items)
+
+            total_score = sum(
+                float(item.get("marks") or 0)
+                for item in all_post_items
+                if item.get("question_status") == "Correct"
+            )
+
+            mod_total_questions = max(total_configured_questions, completed_questions)
+            mod_total_marks = max(float(total_configured_marks), float(total_marks))
+
+            percentage = (
+                min(
+                    100,
+                    round(
+                        (total_score / mod_total_marks) * 100,
+                        2,
+                    ),
+                )
+                if mod_total_marks > 0
+                else 0
+            )
+
+            is_module_completed = bool(
+                mod_total_questions > 0
+                and completed_questions >= mod_total_questions
+            )
+
+            module_results.append(
+                {
+                    "module_id": parent_id,
+                    "module_name": module_name,
+                    "has_data": completed_questions > 0,
+                    "is_completed": is_module_completed,
+                    "attempt_id": last_attempt_id,
+                    "attempted_module_id": attempted_module_id,
+                    "total_questions": mod_total_questions,
+                    "completed_questions": completed_questions,
+                    "correct": total_correct,
+                    "wrong": total_wrong,
+                    "score": total_score,
+                    "total_marks": mod_total_marks,
+                    "percentage": percentage,
+                    "mcq_list": post_mcq,
+                    "scq_list": post_scq,
+                    "bucket_list": post_bucket,
+                    "match_making_list": post_mm,
+                }
+            )
+
+            # ============================================================
+            # Update overall totals
+            # ============================================================
+            overall_total_questions += mod_total_questions
+            overall_completed_questions += completed_questions
+            overall_correct += total_correct
+            overall_wrong += total_wrong
+            overall_score += float(total_score)
+            overall_total_marks += float(mod_total_marks)
+
+        # ============================================================
+        # Calculate overall summary
+        # ============================================================
+        overall_percentage = (
+            round(
+                (overall_score / overall_total_marks) * 100,
+                2,
+            )
+            if overall_total_marks > 0
+            else 0
+        )
+
+        overall_progress = (
+            min(
+                100.0,
+                round(
+                    (overall_completed_questions / overall_total_questions) * 100,
+                    2,
+                ),
+            )
+            if overall_total_questions > 0
+            else 0
+        )
+
+        # ============================================================
+        # Optional: Sort modules by module name
+        # (Remove if original order should be preserved)
+        # ============================================================
+        module_results = sorted(module_results, key=lambda x: x["module_name"] or "")
+
+        # ── Module-level completion counts (parent-level) ─────────────────────
+        # Completed strictly if all assigned questions for that parent module are completed
+        total_assigned_modules = len(module_results)
+        completed_modules = sum(
+            1
+            for m in module_results
+            if m.get("total_questions", 0) > 0
+            and m.get("completed_questions", 0) >= m.get("total_questions", 0)
+        )
+        module_completion_percentage = (
+            round((completed_modules / total_assigned_modules) * 100, 2)
+            if total_assigned_modules > 0
+            else 0.0
+        )
+
+        # ============================================================
+        # Return summary
+        # ============================================================
+        return {
+            "module_results": module_results,
+            "total_questions": overall_total_questions,
+            "completed_questions": overall_completed_questions,
+            "correct": overall_correct,
+            "wrong": overall_wrong,
+            "score": overall_score,
+            "total_marks": overall_total_marks,
+            "percentage": overall_percentage,
+            "progress": overall_progress,
+            "total_assigned_modules": total_assigned_modules,
+            "completed_modules": completed_modules,
+            "module_completion_percentage": module_completion_percentage,
+        }
+
+    @staticmethod
+    def get_attempt_wise_result(
+        db: Session,
+        participant_id: int,
+    ):
+
+        # ============================================================
+        # LOAD MASTER DATA
+        # ============================================================
+
+        mcq_master_data = {x.mcq_id: x for x in db.query(McqMaster).all()}
+
+        scq_master_data = {x.scq_id: x for x in db.query(ScqMaster).all()}
+
+        bucket_master_data = {
+            x.drop_bucket_id: x for x in db.query(DropBucketMaster).all()
+        }
+
+        match_making_data = {
+            x.match_making_id: x for x in db.query(MatchMakingMaster).all()
+        }
+
+        # ============================================================
+        # MCQ OPTIONS
+        # ============================================================
+
+        mcq_options = defaultdict(list)
+
+        for option in (
+            db.query(McqQuestionOption)
+            .filter(
+                McqQuestionOption.deleted_at.is_(None),
+                McqQuestionOption.status == 1,
+            )
+            .all()
+        ):
+            mcq_options[option.mcq_id].append(option)
+
+        # ============================================================
+        # SCQ OPTIONS
+        # ============================================================
+
+        scq_options = defaultdict(list)
+
+        for option in (
+            db.query(ScqQuestionOption)
+            .filter(
+                ScqQuestionOption.deleted_at.is_(None),
+                ScqQuestionOption.status == 1,
+            )
+            .all()
+        ):
+            scq_options[option.scq_id].append(option)
+
+        # ============================================================
+        # DROP BUCKET DATA
+        # ============================================================
+
+        buckets = db.query(DropBucket).all()
+
+        bucket_items = (
+            db.query(DropBucketItem)
+            .filter(
+                DropBucketItem.deleted_at.is_(None),
+                DropBucketItem.status == 1,
+            )
+            .all()
+        )
+
+        bucket_items_grouped = defaultdict(list)
+
+        for item in bucket_items:
+            bucket_items_grouped[item.bucket_id].append(item)
+
+        # ============================================================
+        # FETCH ALL ATTEMPT IDS
+        # ============================================================
+
+        attempt_ids = set()
+
+        attempt_ids.update(
+            x[0]
+            for x in db.query(ParticipantMcq.attempt_id)
+            .filter(ParticipantMcq.participant_id == participant_id)
+            .distinct()
+            .all()
+            if x[0] is not None
+        )
+
+        attempt_ids.update(
+            x[0]
+            for x in db.query(ParticipantScq.attempt_id)
+            .filter(ParticipantScq.participant_id == participant_id)
+            .distinct()
+            .all()
+            if x[0] is not None
+        )
+
+        attempt_ids.update(
+            x[0]
+            for x in db.query(ParticipantDb.attempt_id)
+            .filter(ParticipantDb.participant_id == participant_id)
+            .distinct()
+            .all()
+            if x[0] is not None
+        )
+
+        attempt_ids.update(
+            x[0]
+            for x in db.query(ParticipantMm.attempt_id)
+            .filter(ParticipantMm.participant_id == participant_id)
+            .distinct()
+            .all()
+            if x[0] is not None
+        )
+
+        all_attempt_ids = sorted(attempt_ids)
+
+        # ============================================================
+        # INITIALIZE RESULT
+        # ============================================================
+
+        attempt_wise_result = []
+
+        # ============================================================
+        # LOOP THROUGH EACH ATTEMPT
+        # ============================================================
+
+        for attempt_id in all_attempt_ids:
+
+            attempt_total_questions = 0
+            attempt_total_correct = 0
+            attempt_total_wrong = 0
+            attempt_total_marks = 0
+            attempt_total_score = 0
+
+            attempt_mcq_list = []
+            attempt_scq_list = []
+            attempt_bucket_list = []
+            attempt_mm_list = []
+
+            left_items = defaultdict(list)
+            for item in db.query(MatchLeftItem).all():
+                left_items[item.match_making_id].append(item)
+
+            right_items = defaultdict(list)
+            for item in db.query(MatchRightItem).all():
+                right_items[item.match_making_id].append(item)
+
+            # The actual correct left -> right pairing, keyed by
+            # match_left_id. Used to show what the correct answer was for a
+            # pairing the trainee got wrong (mirrors how MCQ/SCQ/Drop Bucket
+            # show the correct option even when it wasn't selected).
+            correct_right_by_left = {
+                row.match_left_id: row.match_right_id
+                for row in db.query(MatchCorrectAnswer).filter(
+                    MatchCorrectAnswer.deleted_at.is_(None)
+                )
+            }
+
+            # ============================================================
+            # PROCESS MCQ FOR THIS ATTEMPT
+            # ============================================================
+
+            mcq_attempted_ids = [
+                row[0]
+                for row in (
+                    db.query(ParticipantMcq.mcq_id)
+                    .filter(
+                        ParticipantMcq.participant_id == participant_id,
+                        ParticipantMcq.attempt_id == attempt_id,
+                    )
+                    .distinct()
+                    .all()
+                )
+            ]
+
+            if mcq_attempted_ids:
+
+                # A question may have several selected options and several
+                # correct options. Aggregate the participant's selections into
+                # a set; the MCQ is Correct only when the selected set exactly
+                # matches the correct set (no partial credit). Values are
+                # compared as strings to avoid id/text type mismatches.
+                selected_by_mcq = defaultdict(set)
+
+                for row in (
+                    db.query(
+                        ParticipantMcq.mcq_id,
+                        ParticipantMcq.option_selected,
+                    )
+                    .filter(
+                        ParticipantMcq.participant_id == participant_id,
+                        ParticipantMcq.attempt_id == attempt_id,
+                    )
+                    .all()
+                ):
+                    if row.option_selected is not None:
+                        selected_by_mcq[row.mcq_id].add(str(row.option_selected))
+
+                for mcq_id in mcq_attempted_ids:
+
+                    mcq = mcq_master_data.get(mcq_id)
+
+                    if not mcq:
+                        continue
+
+                    attempt_total_questions += 1
+                    attempt_total_marks += mcq.marks or 0
+
+                    selected_set = selected_by_mcq.get(mcq_id, set())
+
+                    correct_set = {
+                        str(option.mcq_option_id)
+                        for option in mcq_options.get(mcq_id, [])
+                        if str(option.is_mcq_option_correct) in ("1", "True", "true")
+                    }
+
+                    is_correct_answer = (
+                        bool(correct_set) and selected_set == correct_set
+                    )
+
+                    question_status = "Correct" if is_correct_answer else "Wrong"
+
+                    option_list = []
+
+                    for option in mcq_options.get(mcq_id, []):
+
+                        option_id = str(option.mcq_option_id)
+                        is_selected = option_id in selected_set
+                        is_answer = str(option.is_mcq_option_correct) in ("1", "True", "true")
+
+                        if is_selected and is_answer:
+                            option_status = "Correct"
+                        elif is_selected and not is_answer:
+                            option_status = "Wrong"
+                        elif is_answer:
+                            option_status = "Correct"
+                        else:
+                            option_status = ""
+
+                        option_list.append(
+                            {
+                                "mcq_option_text": option.mcq_option_text,
+                                "option_status": option_status,
+                                # Distinguish "the trainee picked this" from
+                                # "this is a correct answer" so the report can
+                                # show the selection and the correct answer
+                                # separately (esp. for wrong answers).
+                                "is_selected": is_selected,
+                                "is_correct": is_answer,
+                            }
+                        )
+
+                    if is_correct_answer:
+                        attempt_total_correct += 1
+                        attempt_total_score += mcq.marks or 0
+                    else:
+                        attempt_total_wrong += 1
+
+                    attempt_mcq_list.append(
+                        {
+                            "mcq_id": mcq.mcq_id,
+                            "mcq_question_title": mcq.mcq_question_title,
+                            "mcq_question_description": mcq.mcq_question_description,
+                            "image_url": mcq.image_url,
+                            "marks": mcq.marks,
+                            "question_status": question_status,
+                            "option": option_list,
+                        }
+                    )
+
+            # ============================================================
+            # PROCESS SCQ FOR THIS ATTEMPT
+            # ============================================================
+
+            scq_attempted_ids = [
+                row[0]
+                for row in (
+                    db.query(ParticipantScq.single_choice_id)
+                    .filter(
+                        ParticipantScq.participant_id == participant_id,
+                        ParticipantScq.attempt_id == attempt_id,
+                    )
+                    .distinct()
+                    .all()
+                )
+            ]
+
+            if scq_attempted_ids:
+
+                scq_selected_options = defaultdict(list)
+
+                for row in (
+                    db.query(
+                        ParticipantScq.single_choice_id,
+                        ParticipantScq.option_selected,
+                    )
+                    .filter(
+                        ParticipantScq.participant_id == participant_id,
+                        ParticipantScq.attempt_id == attempt_id,
+                    )
+                    .all()
+                ):
+                    scq_selected_options[row.single_choice_id].append(
+                        row.option_selected
+                    )
+
+                for scq_id in scq_attempted_ids:
+
+                    scq = scq_master_data.get(scq_id)
+
+                    if not scq:
+                        continue
+
+                    attempt_total_questions += 1
+                    attempt_total_marks += scq.marks or 0
+
+                    selected = scq_selected_options.get(scq_id, [None])[0]
+
+                    question_status = "Wrong"
+
+                    option_list = []
+
+                    for option in scq_options.get(scq_id, []):
+
+                        option_status = ""
+
+                        # Compare as strings to avoid id/text type mismatches
+                        # (option_selected is stored as text) — otherwise the
+                        # trainee's picked option is never flagged.
+                        is_sel = selected is not None and str(
+                            option.scq_option_id
+                        ) == str(selected)
+                        is_ans = str(option.is_scq_option_correct) in ("1", "True", "true")
+
+                        if is_sel and is_ans:
+
+                            option_status = "Correct"
+
+                            question_status = "Correct"
+
+                            attempt_total_correct += 1
+
+                            attempt_total_score += scq.marks or 0
+
+                        elif is_sel and not is_ans:
+
+                            option_status = "Wrong"
+
+                        elif is_ans:
+
+                            option_status = "Correct"
+
+                        option_list.append(
+                            {
+                                "scq_option_text": option.scq_option_text,
+                                "option_status": option_status,
+                                "is_selected": is_sel,
+                                "is_correct": is_ans,
+                            }
+                        )
+
+                    if question_status != "Correct":
+                        attempt_total_wrong += 1
+
+                    attempt_scq_list.append(
+                        {
+                            "scq_id": scq.scq_id,
+                            "scq_question_title": scq.scq_question_title,
+                            "scq_question_description": scq.scq_question_description,
+                            "image_url": scq.image_url,
+                            "marks": scq.marks,
+                            "question_status": question_status,
+                            "option": option_list,
+                        }
+                    )
+
+            # ============================================================
+            # PROCESS DROP BUCKET FOR THIS ATTEMPT
+            # ============================================================
+
+            # bucket_id -> drop_bucket_id mapping
+            bucket_to_master = {
+                bucket.bucket_id: bucket.drop_bucket_id for bucket in buckets
+            }
+
+            bucket_attempted_ids = list(
+                {
+                    bucket_to_master[row.bucket_id]
+                    for row in (
+                        db.query(ParticipantDb.bucket_id)
+                        .filter(
+                            ParticipantDb.participant_id == participant_id,
+                            ParticipantDb.attempt_id == attempt_id,
+                        )
+                        .all()
+                    )
+                    if row.bucket_id in bucket_to_master
+                }
+            )
+
+            if bucket_attempted_ids:
+
+                participant_bucket_answers = defaultdict(lambda: defaultdict(set))
+
+                for row in (
+                    db.query(ParticipantDb)
+                    .filter(
+                        ParticipantDb.participant_id == participant_id,
+                        ParticipantDb.attempt_id == attempt_id,
+                    )
+                    .all()
+                ):
+                    participant_bucket_answers[row.bucket_id][row.item_id].add(
+                        row.item_id
+                    )
+
+                # Flat item_id -> name map so an item the trainee dropped into
+                # the WRONG bucket (its correct bucket differs) can still be
+                # shown by name under that wrong bucket.
+                item_name_by_id = {}
+                for _grp_items in bucket_items_grouped.values():
+                    for _grp_item in _grp_items:
+                        item_name_by_id[_grp_item.drop_bucket_item_id] = (
+                            _grp_item.item_name
+                        )
+
+                for bucket_master_id in bucket_attempted_ids:
+
+                    bucket_master = bucket_master_data.get(bucket_master_id)
+
+                    if not bucket_master:
+                        continue
+
+                    attempt_total_questions += 1
+                    attempt_total_marks += bucket_master.marks or 0
+
+                    bucket_list = []
+
+                    question_correct_items = 0
+                    question_total_items = 0
+
+                    for bucket in buckets:
+
+                        if bucket.drop_bucket_id != bucket_master_id:
+                            continue
+
+                        item_list = []
+
+                        placed_here = set(
+                            participant_bucket_answers.get(bucket.bucket_id, {}).keys()
+                        )
+                        correct_item_ids = set()
+
+                        # Correct items for this bucket (the right answers).
+                        for item in bucket_items_grouped.get(
+                            bucket.bucket_id,
+                            [],
+                        ):
+
+                            question_total_items += 1
+                            correct_item_ids.add(item.drop_bucket_item_id)
+
+                            is_selected = item.drop_bucket_item_id in placed_here
+
+                            if is_selected:
+                                question_correct_items += 1
+
+                            item_list.append(
+                                {
+                                    "item_id": item.drop_bucket_item_id,
+                                    "item_name": item.item_name,
+                                    # is_answer = belongs in this bucket;
+                                    # is_selected = trainee dropped it here.
+                                    "is_answer": True,
+                                    "is_selected": is_selected,
+                                    "is_correct": is_selected,
+                                }
+                            )
+
+                        # Items the trainee WRONGLY dropped into this bucket
+                        # (they belong to a different bucket).
+                        for placed_id in placed_here:
+                            if placed_id in correct_item_ids:
+                                continue
+                            item_list.append(
+                                {
+                                    "item_id": placed_id,
+                                    "item_name": item_name_by_id.get(placed_id, ""),
+                                    "is_answer": False,
+                                    "is_selected": True,
+                                    "is_correct": False,
+                                }
+                            )
+
+                        bucket_list.append(
+                            {
+                                "bucket_id": bucket.bucket_id,
+                                "bucket_name": bucket.bucket_name,
+                                "bucket_image": bucket.bucket_image,
+                                "items": item_list,
+                            }
+                        )
+
+                    question_status = "Wrong"
+
+                    if question_correct_items > 0:
+
+                        if question_correct_items == question_total_items:
+
+                            question_status = "Correct"
+
+                            attempt_total_correct += 1
+
+                            attempt_total_score += bucket_master.marks or 0
+
+                        else:
+
+                            attempt_total_wrong += 1
+
+                    else:
+
+                        attempt_total_wrong += 1
+
+                    attempt_bucket_list.append(
+                        {
+                            "drop_bucket_id": bucket_master_id,
+                            "drop_bucket_question_title": bucket_master.drop_bucket_question_title,
+                            "drop_bucket_question_description": bucket_master.drop_bucket_question_description,
+                            "image_url": bucket_master.image_url,
+                            "marks": bucket_master.marks,
+                            "question_status": question_status,
+                            "buckets": bucket_list,
+                        }
+                    )
+
+            # ============================================================
+            # PROCESS MATCH MAKING
+            # ============================================================
+
+            mm_attempted_ids = [
+                row[0]
+                for row in (
+                    db.query(ParticipantMm.question_id)
+                    .filter(
+                        ParticipantMm.participant_id == participant_id,
+                        ParticipantMm.attempt_id == attempt_id,
+                    )
+                    .distinct()
+                    .all()
+                )
+            ]
+
+            if mm_attempted_ids:
+
+                participant_mm_answers = defaultdict(list)
+
+                for row in (
+                    db.query(ParticipantMm)
+                    .filter(
+                        ParticipantMm.participant_id == participant_id,
+                        ParticipantMm.attempt_id == attempt_id,
+                    )
+                    .all()
+                ):
+                    participant_mm_answers[row.question_id].append(row)
+
+                for mm_id in mm_attempted_ids:
+
+                    mm_master = match_making_data.get(mm_id)
+
+                    if not mm_master:
+                        continue
+
+                    attempt_total_questions += 1
+                    attempt_total_marks += mm_master.marks or 0
+
+                    answers = participant_mm_answers.get(mm_id, [])
+
+                    question_status = "Correct"
+
+                    if any(str(a.is_correct) != "1" for a in answers):
+                        question_status = "Wrong"
+
+                    if question_status == "Correct":
+                        attempt_total_correct += 1
+                        attempt_total_score += mm_master.marks or 0
+                    else:
+                        attempt_total_wrong += 1
+
+                    left_list = []
+
+                    for left in left_items.get(mm_id, []):
+
+                        # The stored answer row for this specific left item —
+                        # carries the trainee's pick AND its own is_correct
+                        # flag, computed at submission time from the actual
+                        # correct mapping (never re-derived from position).
+                        answer_row = next(
+                            (
+                                a
+                                for a in answers
+                                if str(a.left_option) == str(left.match_left_id)
+                            ),
+                            None,
+                        )
+
+                        selected = answer_row.right_option if answer_row else None
+                        is_pair_correct = (
+                            answer_row is not None and str(answer_row.is_correct) in ("1", "True", "true")
+                        )
+
+                        left_list.append(
+                            {
+                                "match_left_id": left.match_left_id,
+                                "match_left_text": left.match_left_text,
+                                "selected_right": selected,
+                                # Per-pair correctness, straight from the
+                                # stored answer row.
+                                "is_selected": answer_row is not None,
+                                "is_correct": is_pair_correct,
+                                # The actual correct right item for this left
+                                # item, so a wrong pairing can still show
+                                # what the right answer was.
+                                "correct_right": correct_right_by_left.get(
+                                    left.match_left_id
+                                ),
+                            }
+                        )
+
+                    right_list = []
+
+                    for right in right_items.get(mm_id, []):
+
+                        right_list.append(
+                            {
+                                "match_right_id": right.match_right_id,
+                                "match_right_text": right.match_right_text,
+                            }
+                        )
+
+                    attempt_mm_list.append(
+                        {
+                            "match_making_id": mm_id,
+                            "match_making_question_title": mm_master.match_making_question_title,
+                            "match_making_question_description": mm_master.match_making_question_description,
+                            "image_url": mm_master.image_url,
+                            "marks": mm_master.marks,
+                            "question_status": question_status,
+                            "left_items": left_list,
+                            "right_items": right_list,
+                        }
+                    )
+
+            # ============================================================
+            # STORE THIS ATTEMPT
+            # ============================================================
+
+            course_progress = (
+                round(
+                    (attempt_total_correct / attempt_total_questions) * 100,
+                    2,
+                )
+                if attempt_total_questions > 0
+                else 0
+            )
+
+            attempt_wise_result.append(
+                {
+                    "attempt_id": attempt_id,
+                    "total_questions": attempt_total_questions,
+                    "total_correct": attempt_total_correct,
+                    "total_wrong": attempt_total_wrong,
+                    "total_marks": float(attempt_total_marks),
+                    "total_score": float(attempt_total_score),
+                    "course_progress": course_progress,
+                    "mcq_list": attempt_mcq_list,
+                    "scq_list": attempt_scq_list,
+                    "bucket_list": attempt_bucket_list,
+                    "match_making_list": attempt_mm_list,
+                }
+            )
+
+        # ============================================================
+        # CALCULATE OVERALL TOTALS
+        # ============================================================
+
+        overall_total_questions = sum(x["total_questions"] for x in attempt_wise_result)
+
+        overall_total_correct = sum(x["total_correct"] for x in attempt_wise_result)
+
+        overall_total_wrong = sum(x["total_wrong"] for x in attempt_wise_result)
+
+        overall_total_marks = sum(x["total_marks"] for x in attempt_wise_result)
+
+        overall_total_score = sum(x["total_score"] for x in attempt_wise_result)
+
+        overall_course_progress = (
+            round(
+                (overall_total_correct / overall_total_questions) * 100,
+                2,
+            )
+            if overall_total_questions > 0
+            else 0
+        )
+
+        return {
+            "attempt_wise_result": attempt_wise_result,
+            "overall_total_questions": overall_total_questions,
+            "overall_total_correct": overall_total_correct,
+            "overall_total_wrong": overall_total_wrong,
+            "overall_total_marks": overall_total_marks,
+            "overall_total_score": overall_total_score,
+            "overall_course_progress": overall_course_progress,
+        }
+
+    @staticmethod
+    def get_module_report(
+        db: Session,
+        participant_id: int,
+    ):
+
+        # ============================================================
+        # PARTICIPANT PROFILE
+        # ============================================================
+        participant = UserRepository.get_participant_profile(
+            db=db,
+            participant_id=participant_id,
+        )
+
+        participant_profile = None
+
+        if participant:
+            participant_profile = {
+                "participant_id": participant.participant_id,
+                "participant_name": participant.participant_name or "Trainee",
+                "enrollment_no": participant.enrollment_no or "-",
+                "mobile_no": participant.mobile_no,
+                "email": participant.email,
+                "state_name": participant.state_name,
+                "district_name": participant.district_name,
+                "centre_name": participant.centre_name,
+                "location": participant.location,
+                "image": participant.image,
+            }
+
+        # ============================================================
+        # ATTEMPT WISE RESULT
+        # ============================================================
+        attempt_result = UserRepository.get_attempt_wise_result(
+            db=db,
+            participant_id=participant_id,
+        )
+
+        # ============================================================
+        # ASSESSMENT SUMMARY
+        # ============================================================
+        assessment_summary = UserRepository.get_assessment_summary(
+            db=db,
+            participant_id=participant_id,
+            attempt_wise_result=attempt_result["attempt_wise_result"],
+        )
+
+        # ============================================================
+        # RETURN
+        # ============================================================
+        return {
+            "participant_profile": participant_profile,
+            "attempt_wise_result": attempt_result,
+            "assessment_summary": assessment_summary,
+        }
+
+    # ==================================================================
+    # Manage Modules (instance-style helpers)
+    # ==================================================================
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_module_by_id(self, module_id: int):
+        return (
+            self.db.query(ModuleMaster)
+            .filter(ModuleMaster.module_id == module_id)
+            .first()
+        )
+
+    def get_module_group(self, module):
+        # Every language variant of the module (same parent group).
+        parent_key = module.parent_id or module.module_id
+        return (
+            self.db.query(ModuleMaster)
+            .filter(
+                ModuleMaster.deleted_at.is_(None),
+                or_(
+                    ModuleMaster.parent_id == parent_key,
+                    ModuleMaster.module_id == parent_key,
+                ),
+            )
+            .all()
+        )
+
+    def get_modules_by_language(self, language_id: int):
+        return (
+            self.db.query(
+                ModuleMaster.module_id,
+                ModuleMaster.parent_id,
+                ModuleMaster.module_name,
+                ModuleMaster.language_id,
+                ModuleType.module_type.label("module_type"),
+            )
+            .outerjoin(
+                ModuleType,
+                ModuleType.module_type_id == cast(ModuleMaster.module_type, BigInteger),
+            )
+            .filter(
+                ModuleMaster.language_id == language_id,
+                ModuleMaster.deleted_at.is_(None),
+            )
+            .order_by(ModuleMaster.module_id)
+            .all()
+        )
+
+    def get_assigned_module_ids(self, participant_id: int):
+        rows = (
+            self.db.query(ParticipantModule.module_id)
+            .filter(
+                ParticipantModule.participant_id == participant_id,
+                or_(
+                    ParticipantModule.status == "1",
+                    ParticipantModule.status == "2",
+                    ParticipantModule.status.ilike("completed"),
+                    ParticipantModule.lock_status.isnot(None),
+                ),
+            )
+            .all()
+        )
+        if not rows:
+            rows = (
+                self.db.query(ParticipantModule.module_id)
+                .filter(ParticipantModule.participant_id == participant_id)
+                .all()
+            )
+        return {row.module_id for row in rows}
+
+    def get_participant_module(self, participant_id: int, module_id: int):
+        return (
+            self.db.query(ParticipantModule)
+            .filter(
+                ParticipantModule.participant_id == participant_id,
+                ParticipantModule.module_id == module_id,
+            )
+            .first()
+        )
+
+    def create_participant_module(self, participant_id, course_id, module_id, lock_status: int = 0):
+        # participant_module_id has no DB default, so allocate the next id
+        # explicitly and flush so subsequent inserts in the same request see it.
+        next_id = (
+            self.db.query(func.max(ParticipantModule.participant_module_id)).scalar()
+            or 0
+        ) + 1
+        participant_module = ParticipantModule(
+            participant_module_id=next_id,
+            participant_id=participant_id,
+            course_id=course_id,
+            module_id=module_id,
+            lock_status=lock_status,
+            status="1",
+        )
+        self.db.add(participant_module)
+        self.db.flush()
+        return participant_module
+
+    def delete_participant_modules(self, participant_id: int, module_ids: list):
+        return (
+            self.db.query(ParticipantModule)
+            .filter(
+                ParticipantModule.participant_id == participant_id,
+                ParticipantModule.module_id.in_(module_ids),
+            )
+            .delete(synchronize_session=False)
+        )
+
+    @staticmethod
+    def change_participant_password(db: Session, participant_id: int, new_password: str):
+        participant = (
+            db.query(ParticipantMaster)
+            .filter(
+                ParticipantMaster.participant_id == participant_id,
+                ParticipantMaster.deleted_at.is_(None),
+            )
+            .first()
+        )
+        if not participant:
+            raise HTTPException(status_code=404, detail="Participant not found")
+
+        if participant.password and verify_password(new_password, participant.password):
+            raise HTTPException(status_code=400, detail="Password already saved.")
+
+        participant.password = hash_password(new_password)
+        db.commit()
+        db.refresh(participant)
+        return participant
+
+    def commit(self):
+        self.db.commit()
+
+    def rollback(self):
+        self.db.rollback()
